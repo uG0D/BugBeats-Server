@@ -16,7 +16,7 @@ VARIABLE_LABEL = "rata"
 
 # Umbrales
 MIN_VOLUME_RMS = 0.0001  # Muy sensible
-MIN_CONFIDENCE = 0.75    # Confianza estándar
+MIN_CONFIDENCE = 0.65    # Confianza estándar
 
 app = Flask(__name__)
 clf = None
@@ -124,4 +124,5 @@ def detectar():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
+
 
