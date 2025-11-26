@@ -14,15 +14,17 @@ UBIDOTS_TOKEN = "BBUS-05HpL3CGv101KvETp3hGXsPHSGQuJ6"
 DEVICE_LABEL = "bugbeats"
 VARIABLE_LABEL = "rata"
 
-# Ajustamos el umbral de silencio para que sea más permisivo
-MIN_VOLUME_RMS = 0.001  
-MIN_CONFIDENCE = 0.60   
+# UMBRALES (Ajustados para micrófono bajo)
+# 0.0001 es muy bajo, permitirá pasar casi cualquier cosa que no sea cero absoluto.
+MIN_VOLUME_RMS = 0.0001  
+# Confianza requerida (55% es suficiente si el modelo está bien entrenado)
+MIN_CONFIDENCE = 0.55   
 
 app = Flask(__name__)
 clf = None
 
 # --- CARGA DEL MODELO ---
-print("--- 🚀 INICIANDO SERVIDOR CON BOOST DE AUDIO ---")
+print("--- 🚀 SERVIDOR BUGBEATS (AMPLIFICADO) ---")
 try:
     if os.path.exists(MODEL_FILE):
         clf = joblib.load(MODEL_FILE)
@@ -32,6 +34,7 @@ try:
 except Exception as e:
     print(f"❌ ERROR CRÍTICO: {e}")
 
+# Calentamiento para evitar Timeout inicial
 def calentar_motores():
     try:
         dummy = np.zeros(16000)
@@ -67,7 +70,7 @@ def enviar_a_ubidots(es_rata):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "BugBeats AI (Amplified) is Ready 🐀🔊"
+    return "BugBeats Server Ready 🐀"
 
 @app.route('/detectar', methods=['POST'])
 def detectar():
@@ -79,45 +82,39 @@ def detectar():
     if not wav_file: return jsonify({"error": "WAV falló"}), 400
     
     try:
-        # 1. Leer audio con soundfile (Ligero)
+        # Usamos soundfile para leer
         data, _ = sf.read(wav_file)
         if data.dtype != 'float32': data = data.astype('float32')
         
-        # 2. CALCULAR RMS ORIGINAL (Para logs)
         rms_original = np.sqrt(np.mean(data**2))
-        print(f"🔉 Volumen Original (RMS): {rms_original:.5f}")
+        print(f"🔉 Volumen Original (RMS): {rms_original:.6f}")
 
-        # --- 3. NORMALIZACIÓN (EL SECRETO) ---
-        # Si el audio es muy bajito, lo amplificamos digitalmente al máximo posible
+        # --- AMPLIFICACIÓN ---
         max_val = np.max(np.abs(data))
         if max_val > 0:
-            factor_amplificacion = 1.0 / max_val
-            data = data * factor_amplificacion
-            print(f"🚀 Audio Amplificado x{factor_amplificacion:.2f} veces")
+            factor = 1.0 / max_val
+            # Limitamos a x500 para no volver loca a la IA con estática pura
+            if factor > 500: factor = 500 
+            data = data * factor
+            print(f"🚀 Amplificado x{factor:.2f}")
         
-        # Nuevo RMS después de amplificar (solo por curiosidad)
-        rms_boosted = np.sqrt(np.mean(data**2))
-        
-        # 4. FILTRO DE SILENCIO (Usamos el original para descartar ruido eléctrico puro)
-        # Si incluso después de amplificar es puro ruido de fondo, lo matamos.
-        # Pero ojo: comparamos el RMS original para no amplificar estática vacía.
+        # Filtro de Silencio
         if rms_original < MIN_VOLUME_RMS:
-            print("🛑 Señal muerta (Silencio absoluto).")
+            print("🛑 Señal descartada (Silencio absoluto).")
             enviar_a_ubidots(False)
             return jsonify({"status": "ok", "es_rata": 0, "mensaje": "SILENCIO 🔇", "prob": 0.0})
 
-        # 5. IA entra en acción
+        # IA
         mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=13)
         features = np.mean(mfccs.T, axis=0)
 
         probs = clf.predict_proba([features])[0]
         prob_rata = probs[1]
         
-        print(f"📊 Confianza IA: Rata {prob_rata*100:.1f}% | Ambiente {probs[0]*100:.1f}%")
+        print(f"📊 Confianza: Rata {prob_rata*100:.1f}%")
 
         es_rata = (prob_rata >= MIN_CONFIDENCE)
         
-        # Respuesta
         enviar_a_ubidots(es_rata)
         
         return jsonify({
@@ -128,7 +125,7 @@ def detectar():
         })
 
     except Exception as e:
-        print(f"❌ Error procesando: {e}")
+        print(f"❌ Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
