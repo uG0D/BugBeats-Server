@@ -14,17 +14,17 @@ UBIDOTS_TOKEN = "BBUS-05HpL3CGv101KvETp3hGXsPHSGQuJ6"
 DEVICE_LABEL = "bugbeats"
 VARIABLE_LABEL = "rata"
 
-# UMBRALES (Ajustados para micrófono bajo)
-# 0.0001 es muy bajo, permitirá pasar casi cualquier cosa que no sea cero absoluto.
-MIN_VOLUME_RMS = 0.0001  
-# Confianza requerida (55% es suficiente si el modelo está bien entrenado)
-MIN_CONFIDENCE = 0.55   
+# --- UMBRALES FÍSICOS (El filtro anti-estupidez) ---
+MIN_VOLUME_RMS = 0.0001      # Umbral de silencio
+MIN_CONFIDENCE = 0.65        # Confianza mínima de la IA
+MIN_CENTROID_HZ = 1500       # ¡NUEVO! Si el sonido promedio es más grave que esto, NO es rata.
+                             # Las ratas chillan entre 2000Hz y 8000Hz.
+                             # La voz humana/musica suele estar por debajo de 1000Hz.
 
 app = Flask(__name__)
 clf = None
 
-# --- CARGA DEL MODELO ---
-print("--- 🚀 SERVIDOR BUGBEATS (AMPLIFICADO) ---")
+print("--- 🔬 SERVIDOR HÍBRIDO (FÍSICA + IA) ---")
 try:
     if os.path.exists(MODEL_FILE):
         clf = joblib.load(MODEL_FILE)
@@ -34,11 +34,11 @@ try:
 except Exception as e:
     print(f"❌ ERROR CRÍTICO: {e}")
 
-# Calentamiento para evitar Timeout inicial
 def calentar_motores():
     try:
         dummy = np.zeros(16000)
         librosa.feature.mfcc(y=dummy, sr=16000, n_mfcc=13)
+        librosa.feature.spectral_centroid(y=dummy, sr=16000)
         print("🔥 Motores listos.")
     except: pass
 
@@ -61,16 +61,20 @@ def convertir_raw_a_wav(raw_bytes, sample_rate=16000):
 def enviar_a_ubidots(es_rata):
     try:
         val = 1.0 if es_rata else 0.0
-        url = f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}"
-        headers = {"X-Auth-Token": UBIDOTS_TOKEN, "Content-Type": "application/json"}
-        requests.post(url, json={VARIABLE_LABEL: val}, headers=headers, timeout=3)
-        print(f"☁️ Ubidots actualizado: {val}")
-    except Exception as e:
-        print(f"⚠️ Ubidots error: {e}")
+        # Timeout ultra corto (1s) para no bloquear
+        requests.post(
+            f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}",
+            json={VARIABLE_LABEL: val},
+            headers={"X-Auth-Token": UBIDOTS_TOKEN, "Content-Type": "application/json"},
+            timeout=1
+        )
+        print(f"☁️ Ubidots: {val}")
+    except:
+        print("⚠️ Ubidots falló (ignorado)")
 
 @app.route('/', methods=['GET'])
 def home():
-    return "BugBeats Server Ready 🐀"
+    return "BugBeats Physics-Enhanced Server 🐀"
 
 @app.route('/detectar', methods=['POST'])
 def detectar():
@@ -82,45 +86,61 @@ def detectar():
     if not wav_file: return jsonify({"error": "WAV falló"}), 400
     
     try:
-        # Usamos soundfile para leer
         data, _ = sf.read(wav_file)
         if data.dtype != 'float32': data = data.astype('float32')
         
+        # 1. ANÁLISIS DE VOLUMEN (RMS)
         rms_original = np.sqrt(np.mean(data**2))
-        print(f"🔉 Volumen Original (RMS): {rms_original:.6f}")
+        print(f"🔉 RMS Original: {rms_original:.6f}")
 
-        # --- AMPLIFICACIÓN ---
+        # AMPLIFICACIÓN CONTROLADA
         max_val = np.max(np.abs(data))
         if max_val > 0:
             factor = 1.0 / max_val
-            # Limitamos a x500 para no volver loca a la IA con estática pura
-            if factor > 500: factor = 500 
+            # Tope de x200. Más de eso es inventar datos sobre ruido.
+            if factor > 200: factor = 200 
             data = data * factor
             print(f"🚀 Amplificado x{factor:.2f}")
-        
-        # Filtro de Silencio
+
+        # 2. GUARDIÁN 1: SILENCIO
         if rms_original < MIN_VOLUME_RMS:
-            print("🛑 Señal descartada (Silencio absoluto).")
+            print("🛑 Rechazo por Silencio Absoluto.")
             enviar_a_ubidots(False)
             return jsonify({"status": "ok", "es_rata": 0, "mensaje": "SILENCIO 🔇", "prob": 0.0})
 
-        # IA
+        # 3. GUARDIÁN 2: FÍSICA DEL SONIDO (CENTROIDE ESPECTRAL)
+        # Calculamos dónde está la "masa" del sonido (agudo vs grave)
+        cent = librosa.feature.spectral_centroid(y=data, sr=16000)
+        avg_centroid = np.mean(cent)
+        print(f"🎼 Frecuencia Promedio: {avg_centroid:.1f} Hz")
+        
+        # SI EL SONIDO ES GRAVE (Musica, Voz, Golpes, Ruido estático grave) -> DESCARTAR
+        if avg_centroid < MIN_CENTROID_HZ:
+            print(f"🛑 Rechazo por Frecuencia Baja ({avg_centroid:.1f} Hz < {MIN_CENTROID_HZ} Hz). Es ruido o voz.")
+            enviar_a_ubidots(False)
+            return jsonify({"status": "ok", "es_rata": 0, "mensaje": "RUIDO GRAVE 📉", "prob": 0.0})
+
+        # --- SI PASA LOS FILTROS, ENTRA LA IA ---
         mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=13)
         features = np.mean(mfccs.T, axis=0)
 
         probs = clf.predict_proba([features])[0]
         prob_rata = probs[1]
         
-        print(f"📊 Confianza: Rata {prob_rata*100:.1f}%")
+        print(f"🧠 IA Opinión: {prob_rata*100:.1f}% Rata")
 
+        # 4. GUARDIÁN 3: CONFIANZA
         es_rata = (prob_rata >= MIN_CONFIDENCE)
         
         enviar_a_ubidots(es_rata)
         
+        msj = "RATA 🐀" if es_rata else "AMBIENTE 🍃"
+        if es_rata: print("🚨 ¡CONFIRMADO!")
+        
         return jsonify({
             "status": "ok", 
             "es_rata": 1 if es_rata else 0,
-            "mensaje": "RATA 🐀" if es_rata else "AMBIENTE 🍃",
+            "mensaje": msj,
             "confianza": float(prob_rata)
         })
 
