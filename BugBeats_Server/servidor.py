@@ -4,7 +4,8 @@ import librosa
 import numpy as np
 import io
 import wave
-import soundfile as sf  # Usaremos esto para leer más ligero
+import soundfile as sf
+import requests
 from flask import Flask, request, jsonify
 
 # --- CONFIGURACIÓN ---
@@ -13,11 +14,15 @@ UBIDOTS_TOKEN = "BBUS-05HpL3CGv101KvETp3hGXsPHSGQuJ6"
 DEVICE_LABEL = "bugbeats"
 VARIABLE_LABEL = "rata"
 
+# UMBRALES DE SEGURIDAD (¡Aquí está la magia!)
+MIN_VOLUME_RMS = 0.005  # Si el volumen es menor a esto, es Silencio absoluto.
+MIN_CONFIDENCE = 0.65   # La IA debe estar 65% segura para dar la alerta.
+
 app = Flask(__name__)
 clf = None
 
 # --- CARGA DEL MODELO ---
-print("--- 🔵 INICIANDO SERVIDOR ---")
+print("--- 🛡️ INICIANDO SERVIDOR CON FILTROS ---")
 try:
     if os.path.exists(MODEL_FILE):
         clf = joblib.load(MODEL_FILE)
@@ -25,24 +30,17 @@ try:
     else:
         print(f"❌ ERROR: No encuentro '{MODEL_FILE}'")
 except Exception as e:
-    print(f"❌ ERROR CRÍTICO al cargar modelo: {e}")
+    print(f"❌ ERROR CRÍTICO: {e}")
 
-# --- FUNCIÓN DE CALENTAMIENTO (CRUCIAL PARA RENDER) ---
-# Esto obliga a librosa/numba a compilarse ANTES de recibir peticiones
+# Calentamiento (Para evitar Timeout)
 def calentar_motores():
-    print("🔥 Calentando motores de IA...")
     try:
-        # Creamos 1 segundo de silencio falso
-        dummy_audio = np.zeros(16000) 
-        # Forzamos la ejecución de la función pesada
-        librosa.feature.mfcc(y=dummy_audio, sr=16000, n_mfcc=13)
-        print("✅ Motores listos y compilados. Esperando audio real.")
-    except Exception as e:
-        print(f"⚠️ Error en calentamiento (no fatal): {e}")
+        dummy = np.zeros(16000)
+        librosa.feature.mfcc(y=dummy, sr=16000, n_mfcc=13)
+        print("🔥 Motores calientes.")
+    except: pass
 
-# Ejecutamos el calentamiento al iniciar el script
-if clf is not None:
-    calentar_motores()
+if clf: calentar_motores()
 
 def convertir_raw_a_wav(raw_bytes, sample_rate=16000):
     try:
@@ -58,67 +56,77 @@ def convertir_raw_a_wav(raw_bytes, sample_rate=16000):
         print(f"Error WAV: {e}")
         return None
 
-def procesar_audio(wav_file_obj):
-    try:
-        # OPTIMIZACIÓN: Usar soundfile en lugar de librosa.load para ahorrar RAM
-        # soundfile lee directo sin resampling (ya sabemos que viene en 16k)
-        data, samplerate = sf.read(wav_file_obj)
-        
-        # Asegurar que sea float32 (lo que librosa necesita)
-        if data.dtype != 'float32':
-            data = data.astype('float32')
-
-        mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=13)
-        features = np.mean(mfccs.T, axis=0)
-        return features
-    except Exception as e:
-        print(f"❌ Error procesando: {e}")
-        return None
-
 def enviar_a_ubidots(es_rata):
+    # Enviamos en un bloque try/except silencioso para no detener el server
     try:
         val = 1.0 if es_rata else 0.0
-        # Timeout corto para no colgar el servidor
-        requests.post(
-            f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}",
-            json={VARIABLE_LABEL: val},
-            headers={"X-Auth-Token": UBIDOTS_TOKEN, "Content-Type": "application/json"},
-            timeout=5
-        )
-        print(f"✅ Ubidots: {val}")
+        url = f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}"
+        headers = {"X-Auth-Token": UBIDOTS_TOKEN, "Content-Type": "application/json"}
+        # Timeout de 3 segundos para no congelar la respuesta al Pico
+        r = requests.post(url, json={VARIABLE_LABEL: val}, headers=headers, timeout=3)
+        print(f"☁️ Ubidots Status Code: {r.status_code} | Valor: {val}")
     except Exception as e:
-        print(f"⚠️ Ubidots falló (pero no importa): {e}")
+        print(f"⚠️ Ubidots falló: {e}")
 
 @app.route('/', methods=['GET'])
 def home():
-    return "BugBeats AI Ready 🐀"
+    return "BugBeats Smart Server Active 🧠"
 
 @app.route('/detectar', methods=['POST'])
 def detectar():
     if clf is None: return jsonify({"error": "Modelo off"}), 500
 
-    print(f"\n📞 Petición recibida ({len(request.data)} bytes)")
+    print(f"\n📞 Audio recibido: {len(request.data)} bytes")
     
+    # 1. Convertir
     wav_file = convertir_raw_a_wav(request.data)
     if not wav_file: return jsonify({"error": "WAV falló"}), 400
     
-    features = procesar_audio(wav_file)
-    if features is None: return jsonify({"error": "Procesamiento falló"}), 500
-    
-    prediccion = clf.predict([features])[0]
-    es_rata = int(prediccion) == 1
-    
-    # Responder al Pico PRIMERO (para evitar Timeout -110)
-    respuesta = jsonify({
-        "status": "ok", 
-        "es_rata": int(prediccion),
-        "mensaje": "RATA 🐀" if es_rata else "AMBIENTE 🍃"
-    })
-    
-    # Enviar a Ubidots DESPUÉS (o lanzar en hilo aparte idealmente, pero así vale)
-    enviar_a_ubidots(es_rata)
-    
-    return respuesta
+    # 2. Leer y calcular Volumen (RMS)
+    try:
+        data, _ = sf.read(wav_file)
+        if data.dtype != 'float32': data = data.astype('float32')
+        
+        # CÁLCULO DE VOLUMEN
+        rms = np.sqrt(np.mean(data**2))
+        print(f"🔊 Volumen detectado (RMS): {rms:.4f}")
+        
+        # FILTRO 1: EL PORTERO DE SILENCIO
+        if rms < MIN_VOLUME_RMS:
+            print("🛑 Audio demasiado bajo. Clasificado como SILENCIO/AMBIENTE.")
+            enviar_a_ubidots(False)
+            return jsonify({"status": "ok", "es_rata": 0, "mensaje": "SILENCIO 🔇", "prob": 0.0})
+
+        # 3. Extraer características
+        mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=13)
+        features = np.mean(mfccs.T, axis=0)
+
+        # 4. Predicción con PROBABILIDAD
+        # En lugar de .predict(), usamos .predict_proba()
+        probs = clf.predict_proba([features])[0] # Devuelve [Prob_Ambiente, Prob_Rata]
+        prob_rata = probs[1]
+        
+        print(f"📊 Confianza de IA -> Rata: {prob_rata*100:.1f}% | Ambiente: {probs[0]*100:.1f}%")
+
+        # FILTRO 2: UMBRAL DE CONFIANZA
+        es_rata = (prob_rata >= MIN_CONFIDENCE)
+        
+        msj = "RATA 🐀" if es_rata else "AMBIENTE 🍃"
+        if es_rata: print("🚨 ¡ALERTA CONFIRMADA!")
+        
+        # Enviar respuesta
+        enviar_a_ubidots(es_rata)
+        
+        return jsonify({
+            "status": "ok", 
+            "es_rata": 1 if es_rata else 0,
+            "mensaje": msj,
+            "confianza": float(prob_rata)
+        })
+
+    except Exception as e:
+        print(f"❌ Error procesando: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
