@@ -1,9 +1,7 @@
 Flask
 gunicorn
 numpy
-scikit-learn
-joblib
 librosa
-requests
-
 soundfile
+requests
+tflite-runtime
