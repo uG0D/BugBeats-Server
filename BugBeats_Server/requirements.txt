@@ -4,4 +4,4 @@ numpy
 librosa
 soundfile
 requests
-tflite-runtime
+tensorflow-cpu
