@@ -1,4 +1,12 @@
 import os
+
+# --- FIX CRÍTICO PARA RENDER ---
+# Configuramos las carpetas de caché en /tmp ANTES de importar librosa.
+# Esto evita que Numba/Librosa se cuelguen intentando escribir donde no deben.
+os.environ['NUMBA_CACHE_DIR'] = '/tmp'
+os.environ['MPLCONFIGDIR'] = '/tmp'
+os.environ['NUMBA_NUM_THREADS'] = '1' # Evitar conflictos de CPU
+
 import numpy as np
 import librosa
 import io
@@ -6,6 +14,7 @@ import soundfile as sf
 import requests
 import tensorflow as tf
 import gc # Importante para limpiar RAM
+import time
 from flask import Flask, request, jsonify
 
 # --- CONFIGURACIÓN ---
@@ -20,7 +29,7 @@ interpreter = None
 input_details = None
 output_details = None
 
-print("--- 🤖 SERVIDOR NEURONAL (TF CPU OPTIMIZADO) ---")
+print("--- 🤖 SERVIDOR NEURONAL (TF CPU + FIX NUMBA) ---")
 
 # Cargar modelo UNA sola vez al inicio
 try:
@@ -41,6 +50,7 @@ def procesar_audio(audio_data):
     if max_val > 0: audio_data = audio_data / max_val
 
     # MFCCs
+    # print("   (Calculando MFCCs...)") 
     mfccs = librosa.feature.mfcc(y=audio_data, sr=16000, n_mfcc=40)
     features = np.mean(mfccs.T, axis=0)
     return np.array([features], dtype=np.float32)
@@ -52,12 +62,15 @@ def home():
 @app.route('/detectar', methods=['POST'])
 def detectar():
     global interpreter
+    t_inicio = time.time()
+    
     if interpreter is None: return jsonify({"error": "Modelo off"}), 500
 
     print(f"\n📞 Recibido: {len(request.data)} bytes")
     
     try:
         # 1. Leer WAV
+        print("-> 1. Decodificando audio...")
         data, samplerate = sf.read(io.BytesIO(request.data))
         
         # Si es stereo, pasar a mono
@@ -65,18 +78,23 @@ def detectar():
         if data.dtype != 'float32': data = data.astype('float32')
 
         # 2. Inferencia
+        print("-> 2. Extrayendo características (Librosa)...")
         input_data = procesar_audio(data)
+        
+        print("-> 3. Ejecutando Red Neuronal...")
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
         
         output_data = interpreter.get_tensor(output_details[0]['index'])
         prob_rata = float(output_data[0][0])
         
-        print(f"🧠 Confianza: {prob_rata*100:.2f}% Rata")
+        t_total = time.time() - t_inicio
+        print(f"✅ FINALIZADO en {t_total:.2f}s | Confianza: {prob_rata*100:.1f}%")
 
         # 3. Ubidots (Con timeout corto para no bloquear)
         if prob_rata >= MIN_CONFIDENCE:
             try:
+                print("-> 4. Enviando a Ubidots...")
                 requests.post(
                     f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}",
                     json={VARIABLE_LABEL: 1.0},
@@ -85,7 +103,6 @@ def detectar():
                 )
             except: pass
         else:
-            # Enviamos 0.0 a Ubidots también para confirmar que está vivo
              try:
                 requests.post(
                     f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}",
@@ -98,7 +115,7 @@ def detectar():
         # 4. LIMPIEZA DE MEMORIA OBLIGATORIA
         del data
         del input_data
-        gc.collect() # Forzar al servidor a liberar RAM ya mismo
+        gc.collect() 
 
         return jsonify({
             "status": "ok", 
@@ -108,7 +125,7 @@ def detectar():
         })
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error en proceso: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
