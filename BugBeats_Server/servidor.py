@@ -5,7 +5,7 @@ import io
 import wave
 import soundfile as sf
 import requests
-import tflite_runtime.interpreter as tflite 
+import tensorflow as tf # CAMBIO: Usamos TF oficial, no el runtime
 from flask import Flask, request, jsonify
 
 # --- CONFIGURACIÓN ---
@@ -14,8 +14,6 @@ UBIDOTS_TOKEN = "BBUS-05HpL3CGv101KvETp3hGXsPHSGQuJ6"
 DEVICE_LABEL = "bugbeats"
 VARIABLE_LABEL = "rata"
 
-# Las redes neuronales son más seguras. 
-# Si tu prueba local dio muy buenos resultados, podemos confiar en 80%
 MIN_CONFIDENCE = 0.80 
 
 app = Flask(__name__)
@@ -23,12 +21,13 @@ interpreter = None
 input_details = None
 output_details = None
 
-print("--- 🤖 SERVIDOR NEURONAL (TFLITE) ---")
+print("--- 🤖 SERVIDOR NEURONAL (TF CPU) ---")
 
 # CARGAR MODELO
 try:
     if os.path.exists(MODEL_FILE):
-        interpreter = tflite.Interpreter(model_path=MODEL_FILE)
+        # CAMBIO: Usamos tf.lite.Interpreter
+        interpreter = tf.lite.Interpreter(model_path=MODEL_FILE)
         interpreter.allocate_tensors()
         
         input_details = interpreter.get_input_details()
@@ -65,7 +64,6 @@ def detectar():
     try:
         data, samplerate = sf.read(io.BytesIO(request.data))
     except:
-        # Fallback para RAW si fuera necesario
         try:
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, "wb") as wav_file:
@@ -80,17 +78,14 @@ def detectar():
     try:
         if data.dtype != 'float32': data = data.astype('float32')
 
-        # 2. PRE-PROCESAMIENTO (Igual que en el entrenamiento)
-        # Normalizamos volumen al máximo (para que la IA escuche bien)
+        # 2. PRE-PROCESAMIENTO
         max_val = np.max(np.abs(data))
         if max_val > 0:
             data = data / max_val
 
-        # Extraer MFCC (40 características)
         mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=40)
         features = np.mean(mfccs.T, axis=0)
         
-        # Preparar tensor para TFLite (Shape: [1, 40])
         input_data = np.array([features], dtype=np.float32)
         
         # 3. EJECUTAR INFERENCIA
@@ -99,7 +94,7 @@ def detectar():
         
         # 4. OBTENER RESULTADO
         output_data = interpreter.get_tensor(output_details[0]['index'])
-        prob_rata = float(output_data[0][0]) # Probabilidad de 0.0 a 1.0
+        prob_rata = float(output_data[0][0])
         
         print(f"🧠 Confianza Neuronal: {prob_rata*100:.2f}% Rata")
 
