@@ -14,14 +14,13 @@ UBIDOTS_TOKEN = "BBUS-05HpL3CGv101KvETp3hGXsPHSGQuJ6"
 DEVICE_LABEL = "bugbeats"
 VARIABLE_LABEL = "rata"
 
-# Umbrales
-MIN_VOLUME_RMS = 0.0001  # Muy sensible
-MIN_CONFIDENCE = 0.65    # Confianza estándar
+MIN_VOLUME_RMS = 0.0001
+MIN_CONFIDENCE = 0.60
 
 app = Flask(__name__)
 clf = None
 
-print("--- 🧠 SERVIDOR PURO (SOLO IA) ---")
+print("--- 🧠 SERVIDOR UNIVERSAL (WAV + RAW) ---")
 try:
     if os.path.exists(MODEL_FILE):
         clf = joblib.load(MODEL_FILE)
@@ -39,18 +38,6 @@ if clf:
         print("🔥 Motores listos.")
     except: pass
 
-def convertir_raw_a_wav(raw_bytes, sample_rate=16000):
-    try:
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(raw_bytes)
-        wav_buffer.seek(0)
-        return wav_buffer
-    except: return None
-
 def enviar_a_ubidots(es_rata):
     try:
         val = 1.0 if es_rata else 0.0
@@ -65,7 +52,7 @@ def enviar_a_ubidots(es_rata):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "BugBeats AI Server Ready 🐀"
+    return "BugBeats Server Ready 🐀"
 
 @app.route('/detectar', methods=['POST'])
 def detectar():
@@ -73,17 +60,36 @@ def detectar():
 
     print(f"\n📞 Audio recibido: {len(request.data)} bytes")
     
-    wav_file = convertir_raw_a_wav(request.data)
-    if not wav_file: return jsonify({"error": "WAV falló"}), 400
-    
+    # --- CAMBIO CRÍTICO: DETECCIÓN AUTOMÁTICA DE FORMATO ---
+    # Tu nuevo código envía un WAV real. El anterior enviaba RAW.
+    # Este bloque maneja ambos casos.
     try:
-        data, _ = sf.read(wav_file)
+        # Intento 1: Leer directo (Funciona si envías un WAV con encabezado)
+        data, samplerate = sf.read(io.BytesIO(request.data))
+        print("✅ Formato detectado: WAV Válido (desde archivo)")
+    except:
+        print("⚠️ No es WAV estándar. Intentando convertir desde RAW...")
+        try:
+            # Intento 2: Convertir raw a wav (Compatibilidad antigua)
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(request.data)
+            wav_buffer.seek(0)
+            data, samplerate = sf.read(wav_buffer)
+        except Exception as e:
+            return jsonify({"error": "Formato de audio no reconocido"}), 400
+
+    # A partir de aquí, el proceso es igual
+    try:
         if data.dtype != 'float32': data = data.astype('float32')
         
         rms_original = np.sqrt(np.mean(data**2))
-        print(f"🔉 RMS Original: {rms_original:.6f}")
+        print(f"🔉 RMS: {rms_original:.6f}")
 
-        # AMPLIFICACIÓN
+        # Amplificación
         max_val = np.max(np.abs(data))
         if max_val > 0:
             factor = 1.0 / max_val
@@ -91,23 +97,20 @@ def detectar():
             data = data * factor
             print(f"🚀 Amplificado x{factor:.2f}")
 
-        # FILTRO BASICO DE SILENCIO
         if rms_original < MIN_VOLUME_RMS:
             print("🛑 Silencio absoluto.")
             enviar_a_ubidots(False)
             return jsonify({"status": "ok", "es_rata": 0, "mensaje": "SILENCIO 🔇", "prob": 0.0})
 
-        # IA DIRECTA
         mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=13)
         features = np.mean(mfccs.T, axis=0)
 
         probs = clf.predict_proba([features])[0]
         prob_rata = probs[1]
         
-        print(f"🧠 IA Dice: {prob_rata*100:.1f}% Rata")
+        print(f"🧠 IA: {prob_rata*100:.1f}% Rata")
 
         es_rata = (prob_rata >= MIN_CONFIDENCE)
-        
         enviar_a_ubidots(es_rata)
         
         return jsonify({
@@ -124,5 +127,3 @@ def detectar():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
-
-
