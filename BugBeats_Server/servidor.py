@@ -1,42 +1,43 @@
 import os
-import joblib
-import librosa
 import numpy as np
+import librosa
 import io
 import wave
 import soundfile as sf
 import requests
+import tflite_runtime.interpreter as tflite 
 from flask import Flask, request, jsonify
 
 # --- CONFIGURACIÓN ---
-MODEL_FILE = 'modelo_ratas.pkl'
+MODEL_FILE = 'modelo_ratas.tflite'
 UBIDOTS_TOKEN = "BBUS-05HpL3CGv101KvETp3hGXsPHSGQuJ6"
 DEVICE_LABEL = "bugbeats"
 VARIABLE_LABEL = "rata"
 
-MIN_VOLUME_RMS = 0.0001
-MIN_CONFIDENCE = 0.60
+# Las redes neuronales son más seguras. 
+# Si tu prueba local dio muy buenos resultados, podemos confiar en 80%
+MIN_CONFIDENCE = 0.80 
 
 app = Flask(__name__)
-clf = None
+interpreter = None
+input_details = None
+output_details = None
 
-print("--- 🧠 SERVIDOR UNIVERSAL (WAV + RAW) ---")
+print("--- 🤖 SERVIDOR NEURONAL (TFLITE) ---")
+
+# CARGAR MODELO
 try:
     if os.path.exists(MODEL_FILE):
-        clf = joblib.load(MODEL_FILE)
-        print("✅ Cerebro cargado.")
+        interpreter = tflite.Interpreter(model_path=MODEL_FILE)
+        interpreter.allocate_tensors()
+        
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        print(f"✅ Cerebro cargado: {MODEL_FILE}")
     else:
         print(f"❌ ERROR: No encuentro '{MODEL_FILE}'")
 except Exception as e:
-    print(f"❌ ERROR CRÍTICO: {e}")
-
-# Calentamiento
-if clf:
-    try:
-        dummy = np.zeros(16000)
-        librosa.feature.mfcc(y=dummy, sr=16000, n_mfcc=13)
-        print("🔥 Motores listos.")
-    except: pass
+    print(f"❌ ERROR CRÍTICO AL CARGAR TFLITE: {e}")
 
 def enviar_a_ubidots(es_rata):
     try:
@@ -52,25 +53,20 @@ def enviar_a_ubidots(es_rata):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "BugBeats Server Ready 🐀"
+    return "BugBeats Neural Server Active 🧠"
 
 @app.route('/detectar', methods=['POST'])
 def detectar():
-    if clf is None: return jsonify({"error": "Modelo off"}), 500
+    if interpreter is None: return jsonify({"error": "Cerebro desconectado"}), 500
 
     print(f"\n📞 Audio recibido: {len(request.data)} bytes")
     
-    # --- CAMBIO CRÍTICO: DETECCIÓN AUTOMÁTICA DE FORMATO ---
-    # Tu nuevo código envía un WAV real. El anterior enviaba RAW.
-    # Este bloque maneja ambos casos.
+    # 1. LEER EL AUDIO (WAV)
     try:
-        # Intento 1: Leer directo (Funciona si envías un WAV con encabezado)
         data, samplerate = sf.read(io.BytesIO(request.data))
-        print("✅ Formato detectado: WAV Válido (desde archivo)")
     except:
-        print("⚠️ No es WAV estándar. Intentando convertir desde RAW...")
+        # Fallback para RAW si fuera necesario
         try:
-            # Intento 2: Convertir raw a wav (Compatibilidad antigua)
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, "wb") as wav_file:
                 wav_file.setnchannels(1)
@@ -79,49 +75,47 @@ def detectar():
                 wav_file.writeframes(request.data)
             wav_buffer.seek(0)
             data, samplerate = sf.read(wav_buffer)
-        except Exception as e:
-            return jsonify({"error": "Formato de audio no reconocido"}), 400
+        except: return jsonify({"error": "Formato inválido"}), 400
 
-    # A partir de aquí, el proceso es igual
     try:
         if data.dtype != 'float32': data = data.astype('float32')
-        
-        rms_original = np.sqrt(np.mean(data**2))
-        print(f"🔉 RMS: {rms_original:.6f}")
 
-        # Amplificación
+        # 2. PRE-PROCESAMIENTO (Igual que en el entrenamiento)
+        # Normalizamos volumen al máximo (para que la IA escuche bien)
         max_val = np.max(np.abs(data))
         if max_val > 0:
-            factor = 1.0 / max_val
-            if factor > 500: factor = 500 
-            data = data * factor
-            print(f"🚀 Amplificado x{factor:.2f}")
+            data = data / max_val
 
-        if rms_original < MIN_VOLUME_RMS:
-            print("🛑 Silencio absoluto.")
-            enviar_a_ubidots(False)
-            return jsonify({"status": "ok", "es_rata": 0, "mensaje": "SILENCIO 🔇", "prob": 0.0})
-
-        mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=13)
+        # Extraer MFCC (40 características)
+        mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=40)
         features = np.mean(mfccs.T, axis=0)
-
-        probs = clf.predict_proba([features])[0]
-        prob_rata = probs[1]
         
-        print(f"🧠 IA: {prob_rata*100:.1f}% Rata")
+        # Preparar tensor para TFLite (Shape: [1, 40])
+        input_data = np.array([features], dtype=np.float32)
+        
+        # 3. EJECUTAR INFERENCIA
+        interpreter.set_tensor(input_details[0]['index'], input_data)
+        interpreter.invoke()
+        
+        # 4. OBTENER RESULTADO
+        output_data = interpreter.get_tensor(output_details[0]['index'])
+        prob_rata = float(output_data[0][0]) # Probabilidad de 0.0 a 1.0
+        
+        print(f"🧠 Confianza Neuronal: {prob_rata*100:.2f}% Rata")
 
         es_rata = (prob_rata >= MIN_CONFIDENCE)
+        
         enviar_a_ubidots(es_rata)
         
         return jsonify({
             "status": "ok", 
             "es_rata": 1 if es_rata else 0,
             "mensaje": "RATA 🐀" if es_rata else "AMBIENTE 🍃",
-            "confianza": float(prob_rata)
+            "confianza": prob_rata
         })
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error procesando: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
