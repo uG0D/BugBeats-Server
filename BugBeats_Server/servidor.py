@@ -1,11 +1,9 @@
 import os
 
-# --- FIX CRÍTICO PARA RENDER ---
-# Configuramos las carpetas de caché en /tmp ANTES de importar librosa.
-# Esto evita que Numba/Librosa se cuelguen intentando escribir donde no deben.
+# CONFIGURACIÓN DE AMBIENTE PARA RENDER (Vital para evitar cuelgues)
 os.environ['NUMBA_CACHE_DIR'] = '/tmp'
 os.environ['MPLCONFIGDIR'] = '/tmp'
-os.environ['NUMBA_NUM_THREADS'] = '1' # Evitar conflictos de CPU
+os.environ['NUMBA_NUM_THREADS'] = '1'
 
 import numpy as np
 import librosa
@@ -13,119 +11,112 @@ import io
 import soundfile as sf
 import requests
 import tensorflow as tf
-import gc # Importante para limpiar RAM
+import gc
 import time
 from flask import Flask, request, jsonify
 
-# --- CONFIGURACIÓN ---
 MODEL_FILE = 'modelo_ratas.tflite'
 UBIDOTS_TOKEN = "BBUS-05HpL3CGv101KvETp3hGXsPHSGQuJ6"
 DEVICE_LABEL = "bugbeats"
 VARIABLE_LABEL = "rata"
-MIN_CONFIDENCE = 0.80 
+MIN_CONFIDENCE = 0.80
 
 app = Flask(__name__)
 interpreter = None
 input_details = None
 output_details = None
 
-print("--- 🤖 SERVIDOR NEURONAL (TF CPU + FIX NUMBA) ---")
+print("--- 🧠 SERVIDOR INTELIGENTE (AUTO-RESAMPLE) ---")
 
-# Cargar modelo UNA sola vez al inicio
 try:
     if os.path.exists(MODEL_FILE):
         interpreter = tf.lite.Interpreter(model_path=MODEL_FILE)
         interpreter.allocate_tensors()
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
-        print(f"✅ Cerebro cargado.")
-    else:
-        print(f"❌ ERROR: Falta {MODEL_FILE}")
+        print("✅ Modelo cargado.")
 except Exception as e:
-    print(f"❌ ERROR CARGA: {e}")
+    print(f"❌ Error Modelo: {e}")
 
-def procesar_audio(audio_data):
-    # Normalización
-    max_val = np.max(np.abs(audio_data))
-    if max_val > 0: audio_data = audio_data / max_val
-
-    # MFCCs
-    # print("   (Calculando MFCCs...)") 
-    mfccs = librosa.feature.mfcc(y=audio_data, sr=16000, n_mfcc=40)
-    features = np.mean(mfccs.T, axis=0)
-    return np.array([features], dtype=np.float32)
+def enviar_a_ubidots(es_rata):
+    try:
+        val = 1.0 if es_rata else 0.0
+        requests.post(
+            f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}",
+            json={VARIABLE_LABEL: val},
+            headers={"X-Auth-Token": UBIDOTS_TOKEN, "Content-Type": "application/json"},
+            timeout=2
+        )
+    except: pass
 
 @app.route('/', methods=['GET'])
 def home():
-    return "BugBeats AI Alive"
+    return "BugBeats Ready 🐀"
 
 @app.route('/detectar', methods=['POST'])
 def detectar():
     global interpreter
-    t_inicio = time.time()
-    
     if interpreter is None: return jsonify({"error": "Modelo off"}), 500
 
     print(f"\n📞 Recibido: {len(request.data)} bytes")
     
     try:
-        # 1. Leer WAV
-        print("-> 1. Decodificando audio...")
-        data, samplerate = sf.read(io.BytesIO(request.data))
+        # 1. Leer el audio original (sea cual sea su frecuencia)
+        # sf.read devuelve los datos y la frecuencia original (samplerate)
+        data, original_sr = sf.read(io.BytesIO(request.data))
         
-        # Si es stereo, pasar a mono
-        if len(data.shape) > 1: data = data.mean(axis=1)
-        if data.dtype != 'float32': data = data.astype('float32')
+        print(f"   -> Frecuencia original: {original_sr} Hz")
 
-        # 2. Inferencia
-        print("-> 2. Extrayendo características (Librosa)...")
-        input_data = procesar_audio(data)
+        # 2. RESAMPLING AUTOMÁTICO (La clave)
+        # Si el Pico manda 10000Hz, lo subimos a 16000Hz para la IA
+        if original_sr != 16000:
+            print("   -> 🔄 Re-muestrando a 16000 Hz...")
+            # Librosa.resample requiere float, aseguramos tipos
+            if data.dtype != 'float32': data = data.astype('float32')
+            # Transpuesta si es necesario para que librosa lo entienda
+            if len(data.shape) > 1: data = data.mean(axis=1) # Mono
+            
+            # Resamplear
+            data = librosa.resample(data, orig_sr=original_sr, target_sr=16000)
         
-        print("-> 3. Ejecutando Red Neuronal...")
+        # 3. Preparar para IA
+        if data.dtype != 'float32': data = data.astype('float32')
+        
+        # Normalizar volumen
+        max_val = np.max(np.abs(data))
+        if max_val > 0: data = data / max_val
+
+        # 4. Extraer características
+        mfccs = librosa.feature.mfcc(y=data, sr=16000, n_mfcc=40)
+        features = np.mean(mfccs.T, axis=0)
+        
+        input_data = np.array([features], dtype=np.float32)
+        
+        # 5. Predecir
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
-        
         output_data = interpreter.get_tensor(output_details[0]['index'])
         prob_rata = float(output_data[0][0])
         
-        t_total = time.time() - t_inicio
-        print(f"✅ FINALIZADO en {t_total:.2f}s | Confianza: {prob_rata*100:.1f}%")
+        print(f"🧠 Resultado: {prob_rata*100:.1f}% Rata")
 
-        # 3. Ubidots (Con timeout corto para no bloquear)
-        if prob_rata >= MIN_CONFIDENCE:
-            try:
-                print("-> 4. Enviando a Ubidots...")
-                requests.post(
-                    f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}",
-                    json={VARIABLE_LABEL: 1.0},
-                    headers={"X-Auth-Token": UBIDOTS_TOKEN, "Content-Type": "application/json"},
-                    timeout=2
-                )
-            except: pass
-        else:
-             try:
-                requests.post(
-                    f"https://stem.ubidots.com/api/v1.6/devices/{DEVICE_LABEL}",
-                    json={VARIABLE_LABEL: 0.0},
-                    headers={"X-Auth-Token": UBIDOTS_TOKEN, "Content-Type": "application/json"},
-                    timeout=2
-                )
-             except: pass
-
-        # 4. LIMPIEZA DE MEMORIA OBLIGATORIA
+        es_rata = (prob_rata >= MIN_CONFIDENCE)
+        enviar_a_ubidots(es_rata)
+        
+        # Limpieza
         del data
         del input_data
-        gc.collect() 
+        gc.collect()
 
         return jsonify({
             "status": "ok", 
-            "es_rata": 1 if prob_rata >= MIN_CONFIDENCE else 0,
-            "mensaje": "RATA 🐀" if prob_rata >= MIN_CONFIDENCE else "AMBIENTE 🍃",
+            "es_rata": 1 if es_rata else 0, 
+            "mensaje": "RATA 🐀" if es_rata else "AMBIENTE 🍃",
             "confianza": prob_rata
         })
 
     except Exception as e:
-        print(f"❌ Error en proceso: {e}")
+        print(f"❌ Error Server: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
