@@ -1,2 +1,7 @@
 Flask
 gunicorn
+numpy
+librosa
+soundfile
+requests
+tensorflow-cpu
